@@ -1,5 +1,6 @@
 """Acceptance tests for the simulation and mapping domains."""
 import json
+import math
 
 import pytest
 
@@ -7,6 +8,9 @@ from aegisrover.core.types import GridShape, Pose2, Twist2, Vec2
 from aegisrover.mapping.occupancy import LogOddsGrid
 from aegisrover.mapping.revisions import MapFormatError, MapRepository
 from aegisrover.sim.engine import SimulationEngine, SimulationError
+from aegisrover.sim.generator import (Constraints, GenerationConfig, GenerationError, Range,
+                                      ScenarioGenerator, diff_specs, generate_batch, provenance,
+                                      summarize, validate_scenario)
 from aegisrover.sim.scenarios import ScenarioError, ScenarioSpec, ScenarioStore
 from aegisrover.storage.audit import AuditLog
 from aegisrover.storage.repository import Repository
@@ -243,3 +247,95 @@ def test_map_format_roundtrip_and_migration():
     legacy = json.dumps({'width': 2, 'height': 2, 'cells': [0, 1, 2, 3]})
     migrated = MapRepository.decode(MapRepository.migrate(legacy))
     assert migrated['cells'] == {'0,0': 0, '1,0': 1, '0,1': 2, '1,1': 3}
+
+
+# ------------------------------------------------------------------- scenario generation
+def gen_config(**overrides):
+    base = dict(master_seed=11, count=6, step=0.25,
+                duration=Range(1.0, 3.0), robot_count=Range(2, 3),
+                events_per_robot=Range(1, 3),
+                constraints=Constraints(x_min=-5.0, y_min=-5.0, x_max=5.0, y_max=5.0,
+                                        max_linear=2.0, max_angular=2.0, min_separation=0.5))
+    base.update(overrides)
+    return GenerationConfig(**base)
+
+
+def test_generated_batches_are_reproducible_and_seed_sensitive():
+    first = generate_batch(gen_config())
+    assert [s.to_dict() for s in first] == [s.to_dict() for s in generate_batch(gen_config())]
+    other = generate_batch(gen_config(master_seed=12))
+    assert [s.to_dict() for s in first] != [s.to_dict() for s in other]
+    # per-index determinism: a shorter batch is a prefix of a longer one
+    longer = generate_batch(gen_config(count=8))
+    assert [s.to_dict() for s in longer[:6]] == [s.to_dict() for s in first]
+
+
+def test_generated_scenarios_satisfy_physical_constraints():
+    config = gen_config(count=10)
+    for spec in generate_batch(config):
+        assert validate_scenario(spec, config.constraints) == []
+        for event in spec.events:
+            assert 0.0 < event['time'] <= spec.duration
+            ratio = event['time'] / spec.step
+            assert abs(ratio - round(ratio)) < 1e-9  # events land on the step grid
+        poses = [r['pose'] for r in spec.robots]
+        for i, a in enumerate(poses):
+            for b in poses[i + 1:]:
+                assert math.hypot(a[0] - b[0], a[1] - b[1]) >= 0.5
+
+
+def test_generator_rejects_impossible_configs():
+    with pytest.raises(GenerationError):
+        ScenarioGenerator(gen_config(robot_count=Range(3, 2)))
+    with pytest.raises(GenerationError):
+        ScenarioGenerator(gen_config(event_kinds=('launch_missile',)))
+    with pytest.raises(GenerationError):
+        ScenarioGenerator(gen_config(speed=Range(0.0, 9.0)))  # exceeds max_linear
+    with pytest.raises(GenerationError):
+        ScenarioGenerator(gen_config(events_per_robot=Range(1, 99)))  # cannot fit shortest duration
+    cramped = gen_config(robot_count=Range(4, 4),
+                         constraints=Constraints(x_min=0.0, y_min=0.0, x_max=0.1, y_max=0.1,
+                                                 min_separation=1.0))
+    with pytest.raises(GenerationError):
+        ScenarioGenerator(cramped).generate()
+
+
+def test_generated_scenarios_replay_reproducibly(repo):
+    store = ScenarioStore(repo, audit=AuditLog(repo, Clock()), clock=Clock())
+    stored = ScenarioGenerator(gen_config(count=4)).save_batch(store)
+    assert all(s.revision == 1 for s in stored)  # each generated id is a fresh scenario
+    for spec in stored:
+        assert store.verify(spec)
+        result = store.require_reproducible(spec)
+        assert result.steps == round(spec.duration / spec.step)
+        assert len(result.events_applied) == len(spec.events)  # every event fires inside the run
+
+
+def test_generated_scenarios_carry_provenance_and_diff_cleanly():
+    first, second = generate_batch(gen_config(count=2))
+    info = provenance(first)
+    assert info['master_seed'] == 11 and info['index'] == 0
+    assert info['config_digest'] == provenance(second)['config_digest']
+    assert provenance(spec()) == {}  # hand-written scenarios have no provenance
+    diff = diff_specs(first, second)
+    assert 'seed' in diff['changed']  # derived per index, so always differs
+    assert diff_specs(first, first)['changed'] == {}
+    summary = summarize(first)
+    assert summary['event_count'] == len(first.events)
+    assert summary['provenance']['index'] == 0
+
+
+def test_validate_scenario_flags_impossible_handwritten_specs():
+    bad = ScenarioSpec(
+        scenario_id='bad', revision=0, duration=1.0, step=0.25, seed=0,
+        robots=({'name': 'r1', 'pose': [0.0, 0.0, 0.0], 'twist': [0.0, 0.0]},
+                {'name': 'r2', 'pose': [0.1, 0.0, 0.0], 'twist': [0.0, 0.0]}),
+        events=({'time': 0.5, 'kind': 'teleport', 'payload': {'robot': 'r1', 'pose': [99.0, 0.0, 0.0]}},
+                {'time': 9.0, 'kind': 'set_twist', 'payload': {'robot': 'r3', 'linear': 0.5}},
+                {'time': 0.75, 'kind': 'set_twist', 'payload': {'robot': 'r2', 'linear': 50.0}}))
+    problems = validate_scenario(bad, gen_config().constraints)
+    assert any('min_separation' in p for p in problems)
+    assert any('outside bounds' in p for p in problems)
+    assert any('unknown robot' in p for p in problems)
+    assert any('outside [0,' in p for p in problems)
+    assert any('max_linear' in p for p in problems)
